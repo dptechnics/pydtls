@@ -46,6 +46,7 @@ import socket
 import hmac
 import datetime
 import hashlib
+import selectors
 from logging import getLogger
 from os import urandom, fsencode
 from select import select
@@ -487,18 +488,25 @@ class SSLConnection(object):
 
     def _wrap_socket_library_call(self, call, timeout_error):
         timeout_sec_start = timeout_sec = self._check_nbio()
-        # Pass the call if the socket is blocking or non-blocking
-        if not timeout_sec:  # None (blocking) or zero (non-blocking)
+        # Pass the call if the socket is blocking or non-blocking (None or 0)
+        if not timeout_sec:
             return call()
+
         start_time = datetime.datetime.now()
         read_sock = self.get_socket(True)
+        sel = selectors.DefaultSelector()
+        sel.register(read_sock, selectors.EVENT_READ)
+
         need_select = False
         while timeout_sec > 0:
             if need_select:
-                if not select([read_sock], [], [], timeout_sec)[0]:
+                events = sel.select(timeout_sec)
+                if not events:
                     break
-                timeout_sec = timeout_sec_start - \
-                  (datetime.datetime.now() - start_time).total_seconds()
+                # Update remaining timeout
+                elapsed = (datetime.datetime.now() - start_time).total_seconds()
+                timeout_sec = timeout_sec_start - elapsed
+
             try:
                 return call()
             except openssl_error() as err:
@@ -506,6 +514,8 @@ class SSLConnection(object):
                     need_select = True
                     continue
                 raise
+        sel.unregister(read_sock)
+        sel.close()
         raise_ssl_error(timeout_error)
 
     def _get_cookie(self, ssl):
