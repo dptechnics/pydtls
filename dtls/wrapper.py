@@ -29,7 +29,6 @@ Classes:
   DtlsSocket -- DTLS Socket wrapper for use as a client or server
 """
 
-import select
 import time
 import collections
 import selectors
@@ -234,92 +233,111 @@ class DtlsSocket(object):
             return self._recvfrom_on_client_side(bufsize, flags=flags)
 
     def _recvfrom_on_server_side(self, bufsize, flags):
-    sel = selectors.DefaultSelector()
-
-    # Register all sockets to monitor for reading and exceptional conditions
-    def register_sockets():
-        sel.close()  # Close previous selector before re-creating (in case this is called repeatedly)
-        nonlocal sel
         sel = selectors.DefaultSelector()
-        for sock in self._getAllReadingSockets():
-            sel.register(sock, selectors.EVENT_READ)
 
-    register_sockets()
-
-    want_read = False
-    while True:
         try:
-            events = sel.select(timeout=self._timeout)
-        except socket.timeout:
-            # Nothing received within timeout
-            events = []
-        except OSError as ose:
-            if ose.errno != errno.EBADF:
-                raise ose
-            # Connection closed? Do nothing
-            events = []
-
-        if not events:
-            # No sockets ready to read, exit loop
-            break
-
-        for key, mask in events:
-            conn = key.fileobj
-            _last_peer = None
-            try:
+            # Register all sockets to monitor for reading
+            for sock in self._getAllReadingSockets():
                 try:
-                    _last_peer = conn.getpeername()
-                except Exception:
+                    sel.register(sock, selectors.EVENT_READ)
+                except (KeyError, ValueError):
+                    # Socket already registered or invalid
                     pass
 
-                if self._sockIsServerSock(conn):
-                    # Accept new client connection if ready
-                    want_read = self._clientAccept(conn)
-                else:
-                    # Handshake or normal read
-                    if not self._clientHandshakeDone(conn):
-                        self._clientDoHandshake(conn)
-                    else:
-                        buf = self._clientRead(conn, bufsize)
-                        if buf:
-                            if conn in self._clients:
-                                self._clients[conn].updateTimestamp()
-                                return buf, self._clients[conn].getAddr()
+            want_read = False
+            while True:
+                try:
+                    events = sel.select(timeout=self._timeout)
+                except OSError as ose:
+                    if ose.errno != errno.EBADF:
+                        raise ose
+                    # Connection closed? Do nothing
+                    events = []
+
+                if not events:
+                    # No sockets ready to read (timeout), exit loop
+                    break
+
+                for key, mask in events:
+                    conn = key.fileobj
+                    _last_peer = None
+                    try:
+                        try:
+                            _last_peer = conn.getpeername()
+                        except Exception:
+                            pass
+
+                        if self._sockIsServerSock(conn):
+                            # Accept new client connection if ready
+                            want_read = self._clientAccept(conn)
+                            if want_read:
+                                # New client added, re-register sockets
+                                for sock in self._getAllReadingSockets():
+                                    try:
+                                        sel.register(sock, selectors.EVENT_READ)
+                                    except (KeyError, ValueError):
+                                        pass
+                        else:
+                            # Handshake or normal read
+                            if not self._clientHandshakeDone(conn):
+                                self._clientDoHandshake(conn)
                             else:
-                                _logger.warning('Received data from an already disconnected client!')
+                                buf = self._clientRead(conn, bufsize)
+                                if buf:
+                                    if conn in self._clients:
+                                        self._clients[conn].updateTimestamp()
+                                        return buf, self._clients[conn].getAddr()
+                                    else:
+                                        _logger.warning('Received data from an already disconnected client!')
 
-            except Exception as e:
-                _logger.exception('Exception for connection %s %s raised: %s' % (repr(conn), repr(_last_peer), repr(e)))
-                if self._sockIsServerSock(conn) and getattr(e, 'errno', None) == errno.EBADF:
-                    _logger.critical("Bad file descriptor in server socket!")
-                    raise e
-                setattr(e, 'peer', _last_peer)
-                if self._cb_ignore_ssl_exception_read is not None \
-                   and isinstance(self._cb_ignore_ssl_exception_read, collections.Callable) \
-                   and self._cb_ignore_ssl_exception_read(e):
-                    self._clientDrop(conn, e)
-                    continue
-                raise e
+                    except Exception as e:
+                        _logger.exception('Exception for connection %s %s raised: %s' % (repr(conn), repr(_last_peer), repr(e)))
+                        if self._sockIsServerSock(conn) and getattr(e, 'errno', None) == errno.EBADF:
+                            _logger.critical("Bad file descriptor in server socket!")
+                            raise e
+                        setattr(e, 'peer', _last_peer)
+                        if self._cb_ignore_ssl_exception_read is not None \
+                           and isinstance(self._cb_ignore_ssl_exception_read, collections.abc.Callable) \
+                           and self._cb_ignore_ssl_exception_read(e):
+                            self._clientDrop(conn, e)
+                            # Unregister dropped client
+                            try:
+                                sel.unregister(conn)
+                            except (KeyError, ValueError):
+                                pass
+                            continue
+                        raise e
 
-        # Handle timeouts and session expiration
-        for conn in self._getClientReadingSockets():
-            timeleft = conn.get_timeout()
-            if timeleft is not None and timeleft == 0:
-                ret = conn.handle_timeout()
-                _logger.debug('Retransmission triggered for %s: %d' % (str(self._clients[conn].getAddr()), ret))
+                # Handle timeouts and session expiration
+                clients_to_remove = []
+                for conn in self._getClientReadingSockets():
+                    try:
+                        timeleft = conn.get_timeout()
+                        if timeleft is not None and timeleft.total_seconds() == 0:
+                            ret = conn.handle_timeout()
+                            _logger.debug('Retransmission triggered for %s: %s' % (str(self._clients[conn].getAddr()), ret))
+                    except KeyError:
+                        pass
 
-            if self._clients[conn].expired():
-                _logger.info('Found expired session (%s: %s)' % (repr(self._clients[conn].getAddr()), repr(conn)))
-                self._clientRemove(conn)
+                    if conn in self._clients and self._clients[conn].expired():
+                        _logger.info('Found expired session (%s: %s)' % (repr(self._clients[conn].getAddr()), repr(conn)))
+                        clients_to_remove.append(conn)
 
-        if not want_read:
-            break
+                for conn in clients_to_remove:
+                    try:
+                        sel.unregister(conn)
+                    except (KeyError, ValueError):
+                        pass
+                    self._clientRemove(conn)
 
-        # Re-register sockets in case clients were added or removed
-        register_sockets()
+                if not want_read:
+                    break
 
-    # No data received from any client
-    raise socket.timeout
+        finally:
+            sel.close()
+
+        # No data received from any client
+        raise socket.timeout
 
     def _recvfrom_on_client_side(self, bufsize, flags):
         try:
@@ -355,7 +373,7 @@ class DtlsSocket(object):
                 return self._clientWrite(conn_found, buf)
             except Exception as e:
                 if self._cb_ignore_ssl_exception_write is not None \
-                        and isinstance(self._cb_ignore_ssl_exception_write, collections.Callable) \
+                        and isinstance(self._cb_ignore_ssl_exception_write, collections.abc.Callable) \
                         and self._cb_ignore_ssl_exception_write(e):
                     # self._clientDrop(conn_found, e)
                     return 0
@@ -426,7 +444,7 @@ class DtlsSocket(object):
             else:
                 self._clientDrop(conn, error=e)
                 if self._cb_ignore_ssl_exception_in_handshake is not None \
-                   and isinstance(self._cb_ignore_ssl_exception_in_handshake, collections.Callable) \
+                   and isinstance(self._cb_ignore_ssl_exception_in_handshake, collections.abc.Callable) \
                    and self._cb_ignore_ssl_exception_in_handshake(e):
                     return
                 raise e

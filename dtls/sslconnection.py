@@ -49,7 +49,6 @@ import hashlib
 import selectors
 from logging import getLogger
 from os import urandom, fsencode
-from select import select
 from weakref import proxy
 
 from .err import openssl_error, InvalidSocketError
@@ -495,27 +494,30 @@ class SSLConnection(object):
         start_time = datetime.datetime.now()
         read_sock = self.get_socket(True)
         sel = selectors.DefaultSelector()
-        sel.register(read_sock, selectors.EVENT_READ)
 
-        need_select = False
-        while timeout_sec > 0:
-            if need_select:
-                events = sel.select(timeout_sec)
-                if not events:
-                    break
-                # Update remaining timeout
-                elapsed = (datetime.datetime.now() - start_time).total_seconds()
-                timeout_sec = timeout_sec_start - elapsed
+        try:
+            sel.register(read_sock, selectors.EVENT_READ)
+            need_select = False
 
-            try:
-                return call()
-            except openssl_error() as err:
-                if err.ssl_error == SSL_ERROR_WANT_READ:
-                    need_select = True
-                    continue
-                raise
-        sel.unregister(read_sock)
-        sel.close()
+            while timeout_sec > 0:
+                if need_select:
+                    events = sel.select(timeout=max(0, timeout_sec))
+                    if not events:
+                        break
+                    # Update remaining timeout
+                    elapsed = (datetime.datetime.now() - start_time).total_seconds()
+                    timeout_sec = timeout_sec_start - elapsed
+
+                try:
+                    return call()
+                except openssl_error() as err:
+                    if err.ssl_error == SSL_ERROR_WANT_READ:
+                        need_select = True
+                        continue
+                    raise
+        finally:
+            sel.close()
+
         raise_ssl_error(timeout_error)
 
     def _get_cookie(self, ssl):
